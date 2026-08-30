@@ -780,13 +780,22 @@ async function startCamera()
         await qrScanner.start(
             { facingMode: 'environment' },
             {
-                fps: 10,
+                fps: 15,
                 // Wide, short scan box suits linear (1D) barcodes
                 qrbox: (w, h) =>
                 {
-                    const width  = Math.min(Math.round(w * 0.92), 340);
-                    const height = Math.min(Math.round(width * 0.5), Math.round(h * 0.7), 180);
+                    const width  = Math.min(Math.round(w * 0.92), 400);
+                    const height = Math.min(Math.round(width * 0.55), Math.round(h * 0.75), 220);
                     return { width, height };
+                },
+                // Force a high-resolution stream + continuous autofocus.
+                // Sharper frames = far better 1D barcode decoding, esp. on iPhone.
+                videoConstraints: {
+                    facingMode: { ideal: 'environment' },
+                    width:  { ideal: 1920 },
+                    height: { ideal: 1080 },
+                    // Unsupported constraints are ignored gracefully (iOS Safari)
+                    advanced: [ { focusMode: 'continuous' } ]
                 }
             },
             (text) =>
