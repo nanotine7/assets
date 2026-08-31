@@ -400,6 +400,14 @@
                 <div id="camera-view"></div>
                 <p class="cam-status" id="cam-status">正在啟動相機…</p>
 
+                <!-- Manual trigger: only decode when the user taps this button -->
+                <button class="btn btn-blue" id="cam-capture-btn"
+                        onclick="captureNow()"
+                        style="width:100%; margin-top:10px; font-size:17px; padding:14px;">
+                    🔍 讀取條碼
+                </button>
+                <p class="hint-txt">對準條碼後，按一下「讀取條碼」才會辨識（不會一直自動讀）</p>
+
                 <!-- Photo-capture fallback: most reliable on iPhone/iOS Safari -->
                 <div class="photo-scan">
                     <input type="file" id="photo-input" accept="image/*" capture="environment" style="display:none">
@@ -462,6 +470,7 @@ let qrScanner  = null;
 let lastCamCode = '';
 let lastCamTime  = 0;
 const CAM_COOLDOWN = 2000;   // ms before same barcode can trigger again
+let camCaptureArmed = false; // 手動辨識：只有按下「讀取條碼」後短暫開啟辨識
 
 /* ══════════════════════════════════════════════════
    CSV Parser  (BOM · CRLF · quoted fields)
@@ -811,17 +820,22 @@ async function startCamera()
             },
             (text) =>
             {
+                // Manual mode: ignore continuous reads unless the user just tapped 讀取條碼
+                if (!camCaptureArmed) return;
                 const now = Date.now();
                 // Cooldown: ignore same code within 2 seconds (camera re-reads)
                 if (text === lastCamCode && now - lastCamTime < CAM_COOLDOWN) return;
+                camCaptureArmed = false;
+                if (camArmTimer) clearTimeout(camArmTimer);
                 lastCamCode = text;
                 lastCamTime = now;
+                const s = document.getElementById('cam-status');
+                if (s) s.textContent = CAM_READY_TXT;
                 processCode(text.trim(), true);
             },
             () => {}   // scan failure callback – ignore
         );
-        statusEl.textContent = '📷 相機已啟動，請對準條碼';
-        startZxingLoop();   // stronger engine on full-resolution frames
+        statusEl.textContent = '📷 相機已啟動，對準條碼後按「讀取條碼」';
     }
     catch (e)
     {
@@ -832,62 +846,74 @@ async function startCamera()
     }
 }
 
-/* ── Stronger decode loop: grab full-res video frames, decode with zxing-wasm ──
-   Runs alongside html5-qrcode; whichever engine reads first wins (deduped). */
-let zxingTimer  = null;
+/* ── Manual capture: decode ONE frame only when the user taps 讀取條碼 ──
+   Grabs the current full-res video frame with the stronger zxing-wasm engine,
+   and briefly arms the html5-qrcode callback as a fallback. No continuous loop. */
 let zxingBusy   = false;
 let zxingCanvas = null;
+let camArmTimer = null;
+const CAM_READY_TXT = '📷 相機已啟動，對準條碼後按「讀取條碼」';
 
-function startZxingLoop()
+async function captureNow()
 {
-    if (typeof window.__zxingRead !== 'function') return;   // engine not available
-    stopZxingLoop();
-    if (!zxingCanvas) zxingCanvas = document.createElement('canvas');
-    zxingTimer = setInterval(zxingTick, 500);
-}
-
-function stopZxingLoop()
-{
-    if (zxingTimer) { clearInterval(zxingTimer); zxingTimer = null; }
-    zxingBusy = false;
-}
-
-async function zxingTick()
-{
-    if (zxingBusy) return;
-    const video = document.querySelector('#camera-view video');
-    if (!video || !video.videoWidth) return;
-
-    zxingBusy = true;
-    try
+    const statusEl = document.getElementById('cam-status');
+    const video    = document.querySelector('#camera-view video');
+    if (!video || !video.videoWidth)
     {
-        const c   = zxingCanvas;
-        c.width   = video.videoWidth;
-        c.height  = video.videoHeight;
-        const ctx = c.getContext('2d', { willReadFrequently: true });
-        ctx.drawImage(video, 0, 0, c.width, c.height);
-        const imgData = ctx.getImageData(0, 0, c.width, c.height);
+        if (statusEl) statusEl.textContent = '📷 相機尚未就緒，請稍候再按一次';
+        return;
+    }
 
-        const results = await window.__zxingRead(imgData);
-        if (results && results.length && results[0].text)
+    // Arm the live html5-qrcode callback as a fallback for ~1.5s.
+    // If nothing is read by then, prompt the user to retry.
+    camCaptureArmed = true;
+    if (camArmTimer) clearTimeout(camArmTimer);
+    camArmTimer = setTimeout(() =>
+    {
+        if (camCaptureArmed)          // still armed = nothing was read
         {
-            const text = results[0].text;
-            const now  = Date.now();
-            if (!(text === lastCamCode && now - lastCamTime < CAM_COOLDOWN))
+            camCaptureArmed = false;
+            if (statusEl) statusEl.textContent = '❌ 沒讀到，請對準、對焦清楚後再按一次';
+        }
+    }, 1500);
+
+    if (statusEl) statusEl.textContent = '⏳ 讀取中…';
+
+    // Immediate single-shot decode with the stronger engine.
+    if (typeof window.__zxingRead === 'function' && !zxingBusy)
+    {
+        zxingBusy = true;
+        try
+        {
+            if (!zxingCanvas) zxingCanvas = document.createElement('canvas');
+            const c   = zxingCanvas;
+            c.width   = video.videoWidth;
+            c.height  = video.videoHeight;
+            const ctx = c.getContext('2d', { willReadFrequently: true });
+            ctx.drawImage(video, 0, 0, c.width, c.height);
+            const imgData = ctx.getImageData(0, 0, c.width, c.height);
+
+            const results = await window.__zxingRead(imgData);
+            if (results && results.length && results[0].text)
             {
+                const text = String(results[0].text).trim();
+                camCaptureArmed = false;
+                if (camArmTimer) clearTimeout(camArmTimer);
                 lastCamCode = text;
-                lastCamTime = now;
-                processCode(text.trim(), true);
+                lastCamTime = Date.now();
+                if (statusEl) statusEl.textContent = CAM_READY_TXT;
+                processCode(text, true);
             }
         }
+        catch (e) { /* ignore decode errors – armed html5 callback may still catch it */ }
+        finally   { zxingBusy = false; }
     }
-    catch (e) { /* ignore per-frame decode errors */ }
-    finally   { zxingBusy = false; }
 }
 
 async function stopCamera()
 {
-    stopZxingLoop();
+    camCaptureArmed = false;
+    if (camArmTimer) { clearTimeout(camArmTimer); camArmTimer = null; }
     if (qrScanner)
     {
         try { await qrScanner.stop(); } catch (e) {}
