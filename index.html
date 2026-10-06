@@ -252,7 +252,7 @@
         /* ── STATS ───────────────────────────── */
         .stats-row {
             display: grid;
-            grid-template-columns: repeat(3, 1fr);
+            grid-template-columns: repeat(4, 1fr);
             gap: 14px; margin-bottom: 16px;
         }
         .stat-box {
@@ -264,6 +264,7 @@
         .stat-n.blue  { color: var(--accent); }
         .stat-n.green { color: var(--green);  }
         .stat-n.red   { color: var(--red);    }
+        .stat-n.amber { color: var(--amber);  }
         .stat-l { font-size: 12px; color: var(--sub); margin-top: 6px; font-weight: 600; }
 
         /* ── HISTORY ─────────────────────────── */
@@ -313,6 +314,8 @@
 
             .btn       { font-size: 14px; }
             .file-row  { gap: 8px; }
+
+            .stats-row { grid-template-columns: repeat(2, 1fr); }
         }
     </style>
 </head>
@@ -353,7 +356,11 @@
                 <button class="btn btn-grey btn-sm" id="auto-btn" onclick="tryAutoLoad()">
                     🔄 自動載入 assets.csv（備用）
                 </button>
+                <button class="btn btn-red btn-sm" onclick="resetAll()">
+                    🗑️ 清除全部重新開始
+                </button>
             </div>
+            <p class="hint-txt" id="save-status"></p>
 
             <!-- Column selector – shown after CSV loads -->
             <div id="col-selector">
@@ -400,13 +407,13 @@
                 <div id="camera-view"></div>
                 <p class="cam-status" id="cam-status">正在啟動相機…</p>
 
-                <!-- Manual trigger: only decode when the user taps this button -->
+                <!-- Auto-scan is on by default; this button forces one extra high-res decode pass for stubborn codes -->
                 <button class="btn btn-blue" id="cam-capture-btn"
                         onclick="captureNow()"
                         style="width:100%; margin-top:10px; font-size:17px; padding:14px;">
-                    🔍 讀取條碼
+                    🔁 沒讀到？按這裡強制重新辨識
                 </button>
-                <p class="hint-txt">對準條碼後，按一下「讀取條碼」才會辨識（不會一直自動讀）</p>
+                <p class="hint-txt">對準條碼、對焦清楚後會自動辨識並核對，不需按按鈕；若一直讀不到才需要按上面的按鈕</p>
 
                 <!-- Photo-capture fallback: most reliable on iPhone/iOS Safari -->
                 <div class="photo-scan">
@@ -440,6 +447,10 @@
             <div class="stat-n red"   id="s-miss">0</div>
             <div class="stat-l">✗ 未找到</div>
         </div>
+        <div class="stat-box">
+            <div class="stat-n amber" id="s-left">0</div>
+            <div class="stat-l">📋 尚未盤點</div>
+        </div>
     </div>
 
     <!-- ④ 記錄 -->
@@ -465,12 +476,92 @@ let rawRows    = [];          // all parsed rows including header
 let barcodeCol = 0;           // which column index is the barcode
 let scanLog    = [];
 let stats      = { total: 0, ok: 0, miss: 0 };
+let matchedSet = new Set();   // distinct codes already matched correctly (for 尚未盤點 count)
 let bannerTmr  = null;
 let qrScanner  = null;
 let lastCamCode = '';
 let lastCamTime  = 0;
 const CAM_COOLDOWN = 2000;   // ms before same barcode can trigger again
-let camCaptureArmed = false; // 手動辨識：只有按下「讀取條碼」後短暫開啟辨識
+let camCaptureArmed = true;  // 自動辨識：相機持續比對，不需按按鈕（按鈕僅作為強制重讀的備援）
+
+/* ══════════════════════════════════════════════════
+   LocalStorage persistence — keeps progress across
+   page reloads / closing the browser so a multi-day
+   audit doesn't lose yesterday's scans.
+══════════════════════════════════════════════════ */
+const STORAGE_KEY = 'assetAuditState_v1';
+
+function saveState()
+{
+    try
+    {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify({
+            rawRows, csvHdr, barcodeCol,
+            scanLog: scanLog.map(e => ({ ...e, time: e.time.toISOString() })),
+            stats, matched: Array.from(matchedSet),
+            savedAt: new Date().toISOString()
+        }));
+        const el = document.getElementById('save-status');
+        if (el) el.textContent = '💾 已自動儲存於本機（' + new Date().toLocaleTimeString('zh-TW') + '）';
+    }
+    catch (e) { console.warn('儲存失敗：', e); }
+}
+
+function restoreState()
+{
+    let raw;
+    try { raw = localStorage.getItem(STORAGE_KEY); } catch (e) { return false; }
+    if (!raw) return false;
+
+    let data;
+    try { data = JSON.parse(raw); } catch (e) { return false; }
+    if (!data || !Array.isArray(data.rawRows) || data.rawRows.length < 2) return false;
+
+    const n = (data.scanLog || []).length;
+    const ok = confirm(
+        `偵測到上次未完成的盤點紀錄（清單 ${data.rawRows.length - 1} 筆、已掃描 ${n} 筆），要繼續上次的進度嗎？\n\n` +
+        `按「確定」繼續上次進度，按「取消」清除並重新開始。`
+    );
+    if (!ok) { clearSavedState(); return false; }
+
+    rawRows    = data.rawRows;
+    csvHdr     = data.csvHdr;
+    barcodeCol = data.barcodeCol || 0;
+
+    const sel = document.getElementById('col-select');
+    sel.innerHTML = csvHdr.map((h, i) => `<option value="${i}">${h}</option>`).join('');
+    sel.value = barcodeCol;
+    document.getElementById('col-selector').style.display = 'flex';
+
+    buildAssetMap();
+
+    scanLog    = (data.scanLog || []).map(e => ({ ...e, time: new Date(e.time) }));
+    stats      = data.stats || { total: 0, ok: 0, miss: 0 };
+    matchedSet = new Set(data.matched || []);
+
+    renderStats();
+    renderHistory();
+    return true;
+}
+
+function clearSavedState()
+{
+    try { localStorage.removeItem(STORAGE_KEY); } catch (e) {}
+}
+
+function resetAll()
+{
+    if (!confirm('確定要清除全部清單與掃描記錄，重新開始嗎？此動作無法復原。')) return;
+    clearSavedState();
+    rawRows = []; csvHdr = []; barcodeCol = 0;
+    assetMap.clear();
+    scanLog = []; stats = { total: 0, ok: 0, miss: 0 }; matchedSet.clear();
+    document.getElementById('col-selector').style.display = 'none';
+    document.getElementById('save-status').textContent = '';
+    setPill('idle', '尚未載入清單');
+    renderStats();
+    renderHistory();
+}
 
 /* ══════════════════════════════════════════════════
    CSV Parser  (BOM · CRLF · quoted fields)
@@ -535,7 +626,14 @@ function loadRows(rows)
 
     // Default: first column
     barcodeCol = 0;
+    // Loading a (new) list starts a fresh audit session
+    scanLog = [];
+    stats   = { total: 0, ok: 0, miss: 0 };
+    matchedSet.clear();
     buildAssetMap();
+    renderStats();
+    renderHistory();
+    saveState();
 }
 
 function buildAssetMap()
@@ -560,8 +658,10 @@ function applyColSel()
     // Reset log when column changes to avoid confusion
     scanLog = [];
     stats   = { total: 0, ok: 0, miss: 0 };
+    matchedSet.clear();
     renderStats();
     renderHistory();
+    saveState();
 }
 
 /* ══════════════════════════════════════════════════
@@ -663,6 +763,39 @@ function clearInput()
     scanInput.value = '';
     scanInput.focus();
 }
+
+/* ── Global scanner-gun listener ──────────────────────
+   A hardware barcode gun just "types" fast keystrokes + Enter.
+   This works even while camera mode is showing (no text field
+   focused), so operators can keep a scanner gun plugged in as
+   a backup without switching modes. */
+let gunBuf = '';
+let gunBufTimer = null;
+
+document.addEventListener('keydown', function (e)
+{
+    const ae = document.activeElement;
+    // #scan-input already handles its own Enter above; other text
+    // fields (col-select, etc.) should keep normal keyboard behaviour.
+    if (ae === scanInput) return;
+    if (ae && (ae.tagName === 'SELECT' || ae.tagName === 'TEXTAREA')) return;
+    if (ae && ae.tagName === 'INPUT' && (ae.type === 'text' || ae.type === 'search')) return;
+
+    if (e.key === 'Enter')
+    {
+        const code = gunBuf.trim();
+        gunBuf = '';
+        clearTimeout(gunBufTimer);
+        if (code) processCode(code, false);
+        return;
+    }
+    if (e.key.length === 1)
+    {
+        gunBuf += e.key;
+        clearTimeout(gunBufTimer);
+        gunBufTimer = setTimeout(() => { gunBuf = ''; }, 500);
+    }
+});
 
 /* ══════════════════════════════════════════════════
    Mode Toggle
@@ -820,22 +953,20 @@ async function startCamera()
             },
             (text) =>
             {
-                // Manual mode: ignore continuous reads unless the user just tapped 讀取條碼
-                if (!camCaptureArmed) return;
+                // Continuous auto-scan: fires as soon as the camera focuses on a code.
+                // Cooldown only blocks the SAME code re-triggering within 2s
+                // (camera re-reading the barcode it's still pointed at) —
+                // a different code is always accepted immediately.
                 const now = Date.now();
-                // Cooldown: ignore same code within 2 seconds (camera re-reads)
                 if (text === lastCamCode && now - lastCamTime < CAM_COOLDOWN) return;
-                camCaptureArmed = false;
-                if (camArmTimer) clearTimeout(camArmTimer);
                 lastCamCode = text;
                 lastCamTime = now;
-                const s = document.getElementById('cam-status');
-                if (s) s.textContent = CAM_READY_TXT;
                 processCode(text.trim(), true);
             },
             () => {}   // scan failure callback – ignore
         );
-        statusEl.textContent = '📷 相機已啟動，對準條碼後按「讀取條碼」';
+        camCaptureArmed = true;
+        statusEl.textContent = CAM_READY_TXT;
     }
     catch (e)
     {
@@ -846,13 +977,12 @@ async function startCamera()
     }
 }
 
-/* ── Manual capture: decode ONE frame only when the user taps 讀取條碼 ──
-   Grabs the current full-res video frame with the stronger zxing-wasm engine,
-   and briefly arms the html5-qrcode callback as a fallback. No continuous loop. */
+/* ── Forced re-read: grabs the current full-res video frame with the
+   stronger zxing-wasm engine. Auto-scan (above) handles normal use;
+   this button is a fallback for codes the live detector keeps missing. */
 let zxingBusy   = false;
 let zxingCanvas = null;
-let camArmTimer = null;
-const CAM_READY_TXT = '📷 相機已啟動，對準條碼後按「讀取條碼」';
+const CAM_READY_TXT = '📷 相機已啟動，對準條碼即可自動核對';
 
 async function captureNow()
 {
@@ -864,22 +994,10 @@ async function captureNow()
         return;
     }
 
-    // Arm the live html5-qrcode callback as a fallback for ~1.5s.
-    // If nothing is read by then, prompt the user to retry.
-    camCaptureArmed = true;
-    if (camArmTimer) clearTimeout(camArmTimer);
-    camArmTimer = setTimeout(() =>
-    {
-        if (camCaptureArmed)          // still armed = nothing was read
-        {
-            camCaptureArmed = false;
-            if (statusEl) statusEl.textContent = '❌ 沒讀到，請對準、對焦清楚後再按一次';
-        }
-    }, 1500);
-
     if (statusEl) statusEl.textContent = '⏳ 讀取中…';
 
-    // Immediate single-shot decode with the stronger engine.
+    // Immediate single-shot decode with the stronger engine, bypassing cooldown
+    // since this is an explicit user action.
     if (typeof window.__zxingRead === 'function' && !zxingBusy)
     {
         zxingBusy = true;
@@ -897,23 +1015,27 @@ async function captureNow()
             if (results && results.length && results[0].text)
             {
                 const text = String(results[0].text).trim();
-                camCaptureArmed = false;
-                if (camArmTimer) clearTimeout(camArmTimer);
                 lastCamCode = text;
                 lastCamTime = Date.now();
                 if (statusEl) statusEl.textContent = CAM_READY_TXT;
                 processCode(text, true);
             }
+            else if (statusEl)
+            {
+                statusEl.textContent = '❌ 沒讀到，請對準、對焦清楚後再按一次';
+            }
         }
-        catch (e) { /* ignore decode errors – armed html5 callback may still catch it */ }
-        finally   { zxingBusy = false; }
+        catch (e)
+        {
+            if (statusEl) statusEl.textContent = '❌ 沒讀到，請對準、對焦清楚後再按一次';
+        }
+        finally { zxingBusy = false; }
     }
 }
 
 async function stopCamera()
 {
     camCaptureArmed = false;
-    if (camArmTimer) { clearTimeout(camArmTimer); camArmTimer = null; }
     if (qrScanner)
     {
         try { await qrScanner.stop(); } catch (e) {}
@@ -943,7 +1065,7 @@ function processCode(code, fromCamera)
     scanLog.unshift({ time: new Date(), code, found, info, dup });
 
     stats.total++;
-    if (found && !dup) stats.ok++;
+    if (found && !dup) { stats.ok++; matchedSet.add(code); }
     else if (!found)   stats.miss++;
     renderStats();
 
@@ -951,6 +1073,7 @@ function processCode(code, fromCamera)
     {
         showBanner('warn', '⚠️', '重複掃描',
             `資產 ${code} 已於稍早完成盤點`);
+        playFeedback('dup');
     }
     else if (found)
     {
@@ -960,15 +1083,68 @@ function processCode(code, fromCamera)
             .filter(s => !s.endsWith('：'))
             .join('　');
         showBanner('success', '✅', '已盤點正確', extra || code);
+        playFeedback('ok');
     }
     else
     {
         showBanner('error', '❌', '查無此資產',
             `條碼「${code}」不在清單中`);
+        playFeedback('miss');
     }
 
     renderHistory();
+    saveState();
     if (!fromCamera) clearInput();
+}
+
+/* ══════════════════════════════════════════════════
+   Audio + Vibration feedback — lets the operator
+   confirm a scan without looking at the screen.
+══════════════════════════════════════════════════ */
+let audioCtx = null;
+
+// Browsers block audio until a user gesture; unlock on first tap/click.
+function unlockAudio()
+{
+    if (audioCtx) return;
+    try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); }
+    catch (e) { /* Web Audio unsupported */ }
+}
+document.addEventListener('pointerdown', unlockAudio, { once: true });
+
+function beep(freq, duration, delay)
+{
+    if (!audioCtx) return;
+    const t0  = audioCtx.currentTime + (delay || 0);
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = 'sine';
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(0.25, t0);
+    gain.gain.exponentialRampToValueAtTime(0.001, t0 + duration);
+    osc.connect(gain); gain.connect(audioCtx.destination);
+    osc.start(t0); osc.stop(t0 + duration);
+}
+
+function playFeedback(type)
+{
+    if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+
+    if (type === 'ok')
+    {
+        beep(1760, 0.12);
+        if (navigator.vibrate) navigator.vibrate(70);
+    }
+    else if (type === 'dup')
+    {
+        beep(900, 0.09); beep(900, 0.09, 0.14);
+        if (navigator.vibrate) navigator.vibrate([60, 60, 60]);
+    }
+    else // miss
+    {
+        beep(300, 0.28);
+        if (navigator.vibrate) navigator.vibrate(300);
+    }
 }
 
 /* ══════════════════════════════════════════════════
@@ -1004,6 +1180,7 @@ function renderStats()
     document.getElementById('s-total').textContent = stats.total;
     document.getElementById('s-ok').textContent    = stats.ok;
     document.getElementById('s-miss').textContent  = stats.miss;
+    document.getElementById('s-left').textContent  = Math.max(0, assetMap.size - matchedSet.size);
 }
 
 /* ══════════════════════════════════════════════════
@@ -1060,10 +1237,13 @@ function renderHistory()
 
 function clearHistory()
 {
+    if (scanLog.length && !confirm('確定要清空掃碼記錄（清單不受影響）？')) return;
     scanLog = [];
     stats   = { total: 0, ok: 0, miss: 0 };
+    matchedSet.clear();
     renderStats();
     renderHistory();
+    saveState();
 }
 
 /* ══════════════════════════════════════════════════
@@ -1072,7 +1252,7 @@ function clearHistory()
 window.addEventListener('load', () =>
 {
     scanInput.focus();
-    tryAutoLoad();
+    if (!restoreState()) tryAutoLoad();
 });
 </script>
 </body>
